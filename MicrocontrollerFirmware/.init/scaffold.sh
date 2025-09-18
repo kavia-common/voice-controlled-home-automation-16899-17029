@@ -1,60 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 WORKSPACE="/home/kavia/workspace/code-generation/voice-controlled-home-automation-16899-17029/MicrocontrollerFirmware"
-mkdir -p "$WORKSPACE" "$WORKSPACE/lib"
-# app.py (bind 0.0.0.0 so container-local polling to 127.0.0.1 works)
-if [ ! -f "$WORKSPACE/app.py" ]; then
-  cat > "$WORKSPACE/app.py" <<'PY'
-from flask import Flask, jsonify
-import os
-app = Flask(__name__)
-PORT = int(os.getenv('MC_FW_PORT', '5000'))
-@app.route('/')
-def index():
-    return jsonify({"status":"ok","port":PORT})
-if __name__ == '__main__':
-    # bind 0.0.0.0 so service is reachable inside container; tests poll 127.0.0.1
-    app.run(host='0.0.0.0', port=PORT)
-PY
+mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
+# idempotent exit if package.json already present
+[ -f package.json ] && exit 0
+# ensure vue CLI available
+if ! command -v vue >/dev/null 2>&1; then echo 'vue CLI missing' >&2; exit 3; fi
+VUE_VER=$(vue --version 2>/dev/null || echo "0")
+# choose package manager
+PKG_MANAGER=npm
+[ -f yarn.lock ] && PKG_MANAGER=yarn
+# avoid running interactive scaffold in a populated dir
+if [ -n "$(ls -A "$WORKSPACE")" ]; then echo 'workspace not empty and package.json missing; aborting to avoid vue prompts' >&2; exit 4; fi
+# run documented, non-standard-flag-free scaffold
+vue create . --default --packageManager "$PKG_MANAGER" --no-git || { echo 'vue create failed' >&2; exit 5; }
+# handle rare pre-seeded TypeScript indicator
+if [ -f tsconfig.json ]; then
+  if ! node -e "try{p=require('./package.json'); console.log(Boolean(p.devDependencies&&p.devDependencies['@vue/cli-plugin-typescript']||p.dependencies&&p.dependencies['@vue/cli-plugin-typescript']));}catch(e){process.exit(0)}" | grep -q true; then
+    if [ "$PKG_MANAGER" = "yarn" ]; then yarn add -D @vue/cli-plugin-typescript || true; else npm i -D @vue/cli-plugin-typescript --no-audit --no-fund || true; fi
+    vue invoke typescript || true
+  fi
 fi
-if [ ! -f "$WORKSPACE/requirements.txt" ]; then
-  cat > "$WORKSPACE/requirements.txt" <<'REQ'
-Flask>=2.0
-requests>=2.0
-REQ
-fi
-if [ ! -f "$WORKSPACE/lib/serial_helper.py" ]; then
-  cat > "$WORKSPACE/lib/serial_helper.py" <<'PY'
-# placeholder for pyserial helpers
-try:
-    import serial
-except Exception:
-    serial = None
-
-def open_device(path, baud=115200):
-    if serial is None:
-        raise RuntimeError('pyserial not installed')
-    return serial.Serial(path, baud)
-PY
-fi
-if [ ! -f "$WORKSPACE/.env.example" ]; then
-  cat > "$WORKSPACE/.env.example" <<'ENV'
-MC_FW_PORT=5000
-MC_DEVICE_PATH=/dev/ttyUSB0
-ENV
-fi
-# create a runnable start wrapper that sources the venv and runs the app
-if [ ! -f "$WORKSPACE/run.sh" ]; then
-  cat > "$WORKSPACE/run.sh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-# usage: ./run.sh
-# sources workspace venv activation helper and runs app.py
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck disable=SC1090
-source "$SCRIPT_DIR/.venv_activate.sh"
-exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/app.py"
-SH
-  chmod +x "$WORKSPACE/run.sh"
-fi
-exit 0
+[ -f package.json ] || { echo "scaffold failed: package.json missing" >&2; exit 6; }
+# evidence
+touch /tmp/step-scaffold-002.ok

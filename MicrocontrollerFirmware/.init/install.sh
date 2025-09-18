@@ -1,69 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 WORKSPACE="/home/kavia/workspace/code-generation/voice-controlled-home-automation-16899-17029/MicrocontrollerFirmware"
-# ensure logs dir and venv activation helper
-mkdir -p "$WORKSPACE/logs"
-if [ ! -f "$WORKSPACE/.venv_activate.sh" ]; then
-  echo "venv activation helper missing" >&2
-  exit 2
-fi
-# shellcheck disable=SC1090
-source "$WORKSPACE/.venv_activate.sh"
 cd "$WORKSPACE"
-PIP_LOG="$WORKSPACE/logs/pip.install.log"
-: > "$PIP_LOG"
-# install from requirements with full logging; fail on error
-if [ -f requirements.txt ]; then
-  if ! "$WORKSPACE/.venv/bin/python" -m pip install -r requirements.txt >>"$PIP_LOG" 2>&1; then
-    echo "pip install (requirements.txt) failed; see $PIP_LOG" >&2
-    tail -n 200 "$PIP_LOG" > "$WORKSPACE/logs/pip.install.tail" || true
-    exit 3
+[ -f package.json ] || { echo "package.json not found; run scaffold first" >&2; exit 6; }
+# detect package manager preference
+if [ -f yarn.lock ]; then PKG=yarn; elif [ -f package-lock.json ]; then PKG=npm; else PKG=npm; fi
+# capture versions (guard failures)
+NPM_VER=$(npm -v 2>/dev/null || echo "0")
+YARN_VER=$(yarn -v 2>/dev/null || echo "0")
+# install dependencies with guarded flags
+if [ "$PKG" = "yarn" ]; then
+  if [ -f yarn.lock ]; then
+    # try frozen lockfile; if it fails, fall back to normal install
+    if yarn install --frozen-lockfile 2>/tmp/vue_yarn_frozen_err.log; then :; else
+      yarn install || { echo 'yarn install failed' >&2; exit 7; }
+    fi
+  else
+    yarn install || { echo 'yarn install failed' >&2; exit 7; }
+  fi
+else
+  # npm path: prefer npm ci when a lockfile exists and node_modules absent
+  if [ -f package-lock.json ] && [ ! -d node_modules ]; then
+    # try npm ci guarded; fall back to npm i
+    if npm ci --no-audit --no-fund 2>/tmp/vue_npm_ci_err.log; then :; else
+      npm i --no-audit --no-fund || { echo 'npm install failed' >&2; exit 9; }
+    fi
+  else
+    npm i --no-audit --no-fund || { echo 'npm install failed' >&2; exit 9; }
   fi
 fi
-USE_SERIAL=${USE_SERIAL:-0}
-USE_VOICE=${USE_VOICE:-0}
-POCKETSPHINX=${POCKETSPHINX:-0}
-if [ "$USE_SERIAL" -eq 1 ]; then
-  if ! "$WORKSPACE/.venv/bin/python" -m pip install pyserial >>"$PIP_LOG" 2>&1; then
-    echo "pyserial install failed; see $PIP_LOG" >&2; exit 4
-  fi
+# create .env template only if absent
+ENV_FILE="$WORKSPACE/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  cat > "$ENV_FILE" <<'EOF'
+VUE_APP_BACKEND_URL=http://localhost:3000/api
+VUE_APP_VOICE_KEY=REPLACE_WITH_KEY
+NODE_ENV=development
+PORT=8080
+EOF
 fi
-if [ "$USE_VOICE" -eq 1 ]; then
-  if ! "$WORKSPACE/.venv/bin/python" -m pip install SpeechRecognition >>"$PIP_LOG" 2>&1; then
-    echo "SpeechRecognition install failed; see $PIP_LOG" >&2; exit 5
-  fi
+# create file-based mock only if absent
+MOCK_DIR="$WORKSPACE/src/mocks"
+mkdir -p "$MOCK_DIR"
+MOCK_FILE="$MOCK_DIR/mock-api.json"
+if [ ! -f "$MOCK_FILE" ]; then
+  cat > "$MOCK_FILE" <<'JSON'
+{
+  "status": "ok",
+  "devices": [ { "id": "lamp-1", "state": "off" } ]
+}
+JSON
 fi
-if [ "$POCKETSPHINX" -eq 1 ]; then
-  cat >>"$PIP_LOG" <<'TXT'
-POCKETSPHINX requested but requires native system packages (e.g., swig, libpulse-dev, libasound2-dev) and build tools.
-Non-interactive install must run: sudo apt-get update && sudo apt-get install -y swig libpulse-dev libasound2-dev
-After that, rerun deps step to pip install pocketsphinx.
-TXT
-  echo "pocketsphinx requires native apt packages; cannot auto-install in this step" >&2
-  exit 6
-fi
-# write pip freeze and compare venv vs global for key packages
-"$WORKSPACE/.venv/bin/python" - <<PY > "$WORKSPACE/logs/deps.status" 2>&1
-import importlib, subprocess
-for pkg in ('flask','requests'):
-    try:
-        m = importlib.import_module(pkg)
-        venv = getattr(m,'__version__','unknown')
-    except Exception:
-        venv = 'missing'
-    try:
-        out = subprocess.run(['python3','-c', f"import {pkg}; print(getattr({pkg},'__version__','unknown'))"], capture_output=True, text=True)
-        global_v = out.stdout.strip()
-    except Exception:
-        global_v = 'unknown'
-    line = f"{pkg} venv {venv} global {global_v}"
-    print(line)
-    if venv != 'missing' and global_v not in ('unknown','') and venv != global_v:
-        print('WARNING: version mismatch for', pkg)
-PY
-"$WORKSPACE/.venv/bin/python" -m pip freeze > "$WORKSPACE/logs/pip.freeze" 2>/dev/null || true
-# guard logs size: keep last 5000 lines
-for f in "$WORKSPACE/logs/pip.install.log" "$WORKSPACE/logs/server.stdout" "$WORKSPACE/logs/server.stderr"; do
-  [ -f "$f" ] && tail -n 5000 "$f" > "$f.tmp" && mv "$f.tmp" "$f" || true
-done
-exit 0
+# add serve:headless script idempotently (guard node failures)
+# The node one-liner is tolerant: it will not abort the shell on error
+node -e "try{const fs=require('fs'); const p=JSON.parse(fs.readFileSync('package.json','utf8')); p.scripts=p.scripts||{}; if(!p.scripts['serve:headless']) p.scripts['serve:headless']='vue-cli-service serve --mode development --port 8080 --host 0.0.0.0'; fs.writeFileSync('package.json', JSON.stringify(p,null,2));}catch(e){process.exit(0)}" || true
+# mark success
+touch /tmp/step-deps-003.ok
